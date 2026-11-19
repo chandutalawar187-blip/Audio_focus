@@ -1,6 +1,6 @@
-# Audio Focus prototype
+# Audio Focus
 
-This Windows-only prototype gives a newly audible audio session focus. When
+This Windows-only product gives a newly audible audio session focus. When
 Windows exposes a matching media-control session, it pauses the previous app and
 resumes it at the same playback position when focus returns. Apps without
 usable media controls are muted as a fallback, then restored to their original
