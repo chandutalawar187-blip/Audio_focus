@@ -1,14 +1,15 @@
 # Audio Focus
 
-This Windows-only product gives a newly audible audio session focus. When
+This Windows-only product gives focus to a newly playing media session. When
 Windows exposes a matching media-control session, it pauses the previous app and
 resumes it at the same playback position when focus returns. Apps without
-usable media controls are muted as a fallback, then restored to their original
-mute state.
+pause support are muted as a fallback, then restored to their original mute
+state. Only apps with a Windows media-control session actively reporting
+playback are eligible; notification and other non-media sounds are ignored.
 
-It uses each audio session's peak meter so a browser can release focus when
-playback becomes silent even if its audio session stays open. Focus returns
-after 0.8 seconds of silence by default.
+Focus follows Windows' media playback state, not audio peaks, so silent
+intros and quiet passages still keep focus. When media pauses or stops, the
+most recently preempted app is resumed.
 
 ## Run interactively
 
@@ -18,15 +19,14 @@ python audio_focus.py --dry-run
 ```
 
 `--dry-run` logs intended pause/resume or mute actions without changing audio.
-Remove it to enable audio focus. Use `--silence-timeout` to adjust how long
-audio must be quiet before focus returns:
+Remove it to enable audio focus:
 
 ```powershell
 python audio_focus.py
 ```
 
 Press Ctrl+C to stop. The monitor polls every 200 ms by default; adjust this
-with `--interval`. The default silence timeout is 0.8 seconds.
+with `--interval`.
 
 ## Install as a Windows service
 
@@ -55,5 +55,6 @@ To uninstall, from an elevated PowerShell window run:
 .\uninstall_service.ps1
 ```
 
-Apps already audible when an agent starts are left unchanged if more than one
-is playing, because their relative start times cannot be determined reliably.
+If multiple apps are already playing when an agent starts, it leaves them
+unchanged until playback state changes because their relative start times
+cannot be determined reliably.

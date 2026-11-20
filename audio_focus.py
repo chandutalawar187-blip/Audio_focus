@@ -11,13 +11,12 @@ if sys.platform != "win32":
     raise SystemExit("Audio Focus prototype requires Windows.")
 
 try:
-    from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
+    from pycaw.pycaw import AudioUtilities
 except ImportError as exc:
     raise SystemExit("Install dependencies with: python -m pip install -r requirements.txt") from exc
 
 
 LOG = logging.getLogger("audio-focus")
-PEAK_THRESHOLD = 0.001
 
 
 class WindowsMediaController:
@@ -42,6 +41,14 @@ class WindowsMediaController:
         return bool(process_stem) and process_stem in (
             session.source_app_user_model_id or ""
         ).casefold()
+
+    def is_playing(self, process_name):
+        return any(
+            self._matches(session, process_name)
+            and session.get_playback_info().playback_status
+            == self.playback_status.PLAYING
+            for session in self.manager.get_sessions()
+        )
 
     def can_pause(self, process_name):
         for session in self.manager.get_sessions():
@@ -103,23 +110,21 @@ class Session:
     process_name: str
     audio: object
     active: bool
-    peak: float
 
 
 class AudioFocusMonitor:
-    def __init__(self, dry_run=False, silence_timeout=0.8, media_controller=None):
+    def __init__(self, dry_run=False, media_controller=None):
         self.dry_run = dry_run
-        self.silence_timeout = silence_timeout
         self.media_controller = media_controller
         self.focus_pid = None
-        self.audible_session_ids = set()
         self.original_mute = {}
         self.applied_mute = set()
-        self.last_audible = {}
         self.process_names = {}
         self.paused_media = {}
         self.media_paused_pids = set()
         self.focus_stack = []
+        self.playing_media_pids = set()
+        self.playback_started_at = {}
         self.initialized = False
         self.startup_ambiguous = False
 
@@ -132,7 +137,6 @@ class AudioFocusMonitor:
                 continue
             process = session.Process
             process_name = process.name() if process else f"PID {process_id}"
-            meter = session._ctl.QueryInterface(IAudioMeterInformation)
             sessions.append(
                 Session(
                     session.InstanceIdentifier,
@@ -140,7 +144,6 @@ class AudioFocusMonitor:
                     process_name,
                     session.SimpleAudioVolume,
                     session.State == 1,  # AudioSessionStateActive
-                    meter.GetPeakValue(),
                 )
             )
         return sessions
@@ -171,10 +174,15 @@ class AudioFocusMonitor:
 
     def _apply_focus(self, sessions):
         for session in sessions:
+            is_media_playing = (
+                session.active and self.media_controller is not None
+                and self.media_controller.is_playing(session.process_name)
+            )
             self._set_muted(
                 session,
                 session.active and self.focus_pid is not None
                 and session.process_id != self.focus_pid
+                and is_media_playing
                 and session.process_id not in self.media_paused_pids,
             )
 
@@ -182,6 +190,15 @@ class AudioFocusMonitor:
         previous_focus = self.focus_pid
         if previous_focus == next_focus:
             return
+
+        if next_focus is None:
+            LOG.info("Media focus released from %s (PID %s)",
+                     self.process_names.get(previous_focus, f"PID {previous_focus}"),
+                     previous_focus)
+        else:
+            LOG.info("Media focus -> %s (PID %s)",
+                     self.process_names.get(next_focus, f"PID {next_focus}"),
+                     next_focus)
 
         if previous_focus is not None and self.media_controller is not None:
             process_name = self.process_names.get(
@@ -230,72 +247,67 @@ class AudioFocusMonitor:
         self.process_names.update(
             (session.process_id, session.process_name) for session in sessions
         )
-        active = [session for session in sessions if session.active]
-        audible = [
-            session for session in active
-            if session.peak >= PEAK_THRESHOLD
+        media_playing = [
+            session for session in sessions
+            if self.media_controller is not None
+            and self.media_controller.is_playing(session.process_name)
         ]
-        audible_session_ids = {session.instance_id for session in audible}
-        for session in audible:
-            self.last_audible[session.instance_id] = now
+        media_playing_pids = {session.process_id for session in media_playing}
+        newly_playing_pids = list(
+            dict.fromkeys(
+                session.process_id
+                for session in media_playing
+                if session.process_id not in self.playing_media_pids
+            )
+        )
+        for process_id in newly_playing_pids:
+            self.playback_started_at[process_id] = now
 
         if not self.initialized:
             self.initialized = True
-            self.audible_session_ids = audible_session_ids
-            audible_pids = {session.process_id for session in audible}
-            if len(audible_pids) == 1:
-                self._change_focus(next(iter(audible_pids)))
+            if len(media_playing_pids) == 1:
+                self._change_focus(next(iter(media_playing_pids)))
             else:
-                self.startup_ambiguous = len(audible_pids) > 1
+                self.startup_ambiguous = len(media_playing_pids) > 1
+            self.playing_media_pids = media_playing_pids
             self._apply_focus(sessions)
             return
 
-        newly_audible = [
-            session for session in audible
-            if session.instance_id not in self.audible_session_ids
-        ]
-        self.audible_session_ids = audible_session_ids
-        playing = [
-            session for session in active
-            if now - self.last_audible.get(session.instance_id, float("-inf"))
-            <= self.silence_timeout
-        ]
-        playing_pids = {session.process_id for session in playing}
+        self.playing_media_pids = media_playing_pids
 
         next_focus = self.focus_pid
-        if self.startup_ambiguous and not newly_audible:
-            if len(playing_pids) == 1:
-                next_focus = next(iter(playing_pids))
+        if self.startup_ambiguous and not newly_playing_pids:
+            if len(media_playing_pids) == 1:
+                next_focus = next(iter(media_playing_pids))
+                self.startup_ambiguous = False
             else:
                 next_focus = None
-        elif self.focus_pid not in playing_pids:
+        elif newly_playing_pids:
+            next_focus = newly_playing_pids[-1]
+            self.startup_ambiguous = False
+        elif self.focus_pid not in media_playing_pids:
             next_focus = next(
                 (
                     session.process_id
                     for session in sorted(
-                        playing,
-                        key=lambda candidate: self.last_audible[candidate.instance_id],
+                        media_playing,
+                        key=lambda candidate: self.playback_started_at.get(
+                            candidate.process_id, float("-inf")
+                        ),
                         reverse=True,
                     )
                 ),
                 None,
             )
             if next_focus is None:
-                available_pids = {session.process_id for session in sessions}
                 next_focus = next(
                     (
                         process_id for process_id in reversed(self.focus_stack)
-                        if process_id in available_pids
-                        or process_id in self.paused_media
+                        if process_id in self.paused_media
+                        or process_id in self.media_paused_pids
                     ),
                     None,
                 )
-
-        if newly_audible:
-            next_focus = newly_audible[-1].process_id
-            self.startup_ambiguous = False
-            LOG.info("Audio focus -> %s (PID %s)",
-                     newly_audible[-1].process_name, next_focus)
 
         self._change_focus(next_focus)
         self._apply_focus(sessions)
@@ -317,12 +329,10 @@ class AudioFocusMonitor:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Give the newest audible app audio focus; pause media or mute audio."
+        description="Give actively playing media focus; pause or mute competing apps."
     )
     parser.add_argument("--interval", type=float, default=0.2,
                         help="session polling interval in seconds (default: 0.2)")
-    parser.add_argument("--silence-timeout", type=float, default=0.8,
-                        help="seconds of silence before focus returns (default: 0.8)")
     parser.add_argument("--dry-run", action="store_true",
                         help="log focus changes without changing audio")
     parser.add_argument("--log-file", help="write log output to this file")
@@ -330,9 +340,6 @@ def main():
     args = parser.parse_args()
     if args.interval <= 0:
         parser.error("--interval must be greater than zero")
-    if args.silence_timeout <= 0:
-        parser.error("--silence-timeout must be greater than zero")
-
     logging_options = {
         "level": logging.INFO,
         "format": "%(asctime)s %(levelname)s %(message)s",
@@ -347,10 +354,9 @@ def main():
     media_controller = WindowsMediaController()
     monitor = AudioFocusMonitor(
         dry_run=args.dry_run,
-        silence_timeout=args.silence_timeout,
         media_controller=media_controller,
     )
-    LOG.info("Monitoring audio sessions. Press Ctrl+C to exit.")
+    LOG.info("Monitoring active media playback. Press Ctrl+C to exit.")
     try:
         while True:
             monitor.poll()
